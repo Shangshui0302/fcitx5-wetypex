@@ -40,7 +40,7 @@
 | 账户与设备 | 官方六位匹配码、确认配对、设备组和功能开关 |
 | 跨设备剪贴板 | 文字与原始 PNG 图片双向同步 |
 | 个人词库与常用语 | 本地持久化；设备组同步器已接入 |
-| 语音输入 | PipeWire 流式采集，原版语音引擎编码、VAD、识别、整理与实时预编辑 |
+| 语音输入 | PipeWire/PulseAudio 流式采集，原版语音引擎编码、VAD、识别、整理与实时预编辑 |
 | 问 AI | `=` 上下文触发、真实在线回答和独立问答窗口 |
 | 隔空传送 | 官方传输码与二维码、原版 Flurry LAN 与 WXP2P 直连/中继通道 |
 | V 模式 | 原版计算候选，以及计算、剪贴板、常用语和符号快捷栏 |
@@ -95,7 +95,7 @@ sudo apt install ./fcitx5-wetypex_2.2.3.657-13_amd64.deb
 
 从修订 `8` 起，标准 deb 使用 Ubuntu 22.04 的 glibc 2.35、Qt5 和稳定版 Fcitx5 构建，可用于 Ubuntu 22.04、24.04、26.04 及 Debian 12/13。LLVM unwinder 已显式列入依赖，Ubuntu 26.04 会安装 `llvm-libunwind1`，避免核心因缺少 `libunwind.so.1` 无法启动。
 
-Ubuntu 20.04 和 glibc 2.31 的系统使用独立的 `fcitx5-wetypex-legacy_..._amd64.deb`。安装前需要稳定版 Fcitx5 5.0.14+、fcitx5-qt 5.0.10+ 与 LibIME 1.0.11+；20.04 原生仓库中的 `0.0~git` 预览版使用不同 ABI，不能直接加载此插件。可按 [Fcitx 上游安装说明](https://fcitx-im.org/wiki/Install_Fcitx_5) 安装稳定框架。旧系统包私有静态包含 OpenSSL 3，不替换系统的 OpenSSL 1.1。语音录制还需要提供 `pw-record` 的新版 PipeWire；20.04 原生的 PipeWire 0.2 不包含此工具。
+Ubuntu 20.04 和 glibc 2.31 的系统使用独立的 `fcitx5-wetypex-legacy_..._amd64.deb`。安装前需要稳定版 Fcitx5 5.0.14+、fcitx5-qt 5.0.10+ 与 LibIME 1.0.11+；20.04 原生仓库中的 `0.0~git` 预览版使用不同 ABI，不能直接加载此插件。可按 [Fcitx 上游安装说明](https://fcitx-im.org/wiki/Install_Fcitx_5) 安装稳定框架。旧系统包私有静态包含 OpenSSL 3，不替换系统的 OpenSSL 1.1。语音可使用现有的 PulseAudio 或 pipewire-pulse；现代 PipeWire 使用 `pw-record` 原始 PCM，旧版或缺少该工具时自动选择 `parec`，再回退到 FFmpeg 的 PulseAudio 输入。
 
 源码构建支持 CMake 3.16、C++17、Python 3.8、Qt5.12+，也可自动使用完整的 Qt6 开发环境。用 `-DWETYPE_QT_VERSION=5` 或 `6` 指定界面工具链。配置插件采用发行版的 Fcitx5 安装目录；不同 Qt ABI 的配置入口按构建环境提供。完整设置始终可通过 `fcitx5-wetypex-settings` 打开。
 
@@ -212,7 +212,7 @@ fcitx5-diagnose | less
 - 看不到 WeTypeX：重新加载 Fcitx5，并用 `fcitx5-diagnose` 检查插件搜索路径。
 - 核心启动失败：重新用固定版本官方包执行设置，检查 `manifest.txt` 和 `image.macho` 是否存在。
 - 没有云候选：确认未开启单机模式，并检查设备身份是否已经建立。
-- 语音没有结果：确认 PipeWire 默认输入设备可用，且 `pw-record` 和 FFmpeg 已安装。
+- 语音没有结果：确认默认输入设备可用；旧版 PipeWire 可通过 `parec` 或 FFmpeg 使用现有 PulseAudio 接口。
 - AI 窗口缺少图标：执行 `fcitx5-wetypex-setup --archive ... --icons-only` 重新提取原版界面资源。
 
 更多诊断步骤见[故障排查](docs/troubleshooting.md)。

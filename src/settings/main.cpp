@@ -896,7 +896,7 @@ int main(int argc, char **argv) {
            "启动语音输入",
            wetype::settingBool(settings.value("voice_launch_shortcut"), true),
            {"Ctrl", "Win", "Shift", "×"},
-           "按下可开启语音输入，按任意键均可结束", true,
+           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
            "voice_launch_shortcut"),
        shortcutRow(
            "按住说话",
@@ -1184,7 +1184,7 @@ int main(int argc, char **argv) {
            "启动语音输入",
            wetype::settingBool(settings.value("voice_launch_shortcut"), true),
            {"Ctrl", "Win", "Shift", "×"},
-           "按下可开启语音输入，按任意键均可结束", true,
+           "按下启动或结束；空格结束，回车上屏，Esc 取消", true,
            "voice_launch_shortcut"),
        shortcutRow(
            "按住说话",

@@ -63,15 +63,18 @@ Ubuntu 20.04 使用 legacy 包，且必须先具备稳定版 Fcitx5 5.0.14+、fc
 
 ## 语音没有识别结果
 
-Ubuntu 20.04 自带 PipeWire 0.2，语音录制需要升级到提供 `pw-record` 的新版 PipeWire。文字输入和账户网络功能可独立使用。
+Ubuntu 22.04 的 `pw-record` 0.3.48 不支持 `--raw` 和 `--properties`。辅助程序会检测实际选项，旧版或缺少 `pw-record` 时自动使用 `parec`，再回退到 FFmpeg 的 PulseAudio 输入；也支持 pipewire-pulse。已有系统可继续使用现有音频服务。
 
-先验证默认输入设备：
+根据当前音频服务选择一条命令，验证默认输入设备：
 
 ```bash
+# PipeWire
 pw-record --rate 16000 --channels 1 --format s16 /tmp/wetypex-test.wav
+# PulseAudio / pipewire-pulse
+parec --file-format=wav --rate=16000 --channels=1 --format=s16le > /tmp/wetypex-test.wav
 ```
 
-录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后运行 `fcitx5-wetypex-voice status`，检查 `native_ready`、`vad`、`state` 和时间字段。录音错误见 `state/voice/capture.log`，原版宿主错误见 `state/voice/backend.log`。识别需要联网；首次使用会初始化设备身份。编码和分块由原版引擎完成，FFmpeg 仅用于已有音频文件的解码。原版 VAD 模型可用 `--icons-only` 更新，具体操作见[流式语音输入](voice-input.md)。
+录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后运行 `fcitx5-wetypex-voice status`，检查 `capture_backend`、`native_ready`、`vad`、`state` 和时间字段。录音错误见 `state/voice/capture.log`，原版宿主错误见 `state/voice/backend.log`。识别需要联网；首次使用会初始化设备身份。编码和分块由原版引擎完成，FFmpeg 用于已有音频解码以及缺少 `parec` 时的旧音频接口采集。原版 VAD 模型可用 `--icons-only` 更新，具体操作见[流式语音输入](voice-input.md)。
 
 ## 输入框周期性失焦，候选框消失并留下拼音
 

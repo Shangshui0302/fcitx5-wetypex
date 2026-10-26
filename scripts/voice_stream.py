@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""PipeWire capture and session control for the original native voice engine."""
+"""PipeWire/PulseAudio capture and session control for the original native voice engine."""
 import argparse
 import array
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -59,6 +60,49 @@ def punctuation(text, mode):
         import re
         text = re.sub(r'[，。！？；：、,.!?;:]+', ' ', text)
     return text
+
+
+@functools.lru_cache(maxsize=1)
+def recorder_options():
+    try:
+        result = subprocess.run(['pw-record', '--help'], capture_output=True,
+                                timeout=3)
+        if result.returncode == 0:
+            return result.stdout + result.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return b''
+
+
+def microphone_command(config):
+    microphone = config.get('voice_microphone', '自动检测')
+    selected = microphone and microphone != '自动检测'
+    options = recorder_options()
+    if b'--raw' in options:
+        command = ['pw-record', '--raw', '--rate', '16000', '--channels', '1',
+                   '--format', 's16', '--latency', '20ms']
+        if b'--properties' in options:
+            command += ['--properties',
+                        'application.name=WeTypeX node.name=wetypex-voice-input']
+        if selected:
+            command += ['--target', str(microphone)]
+        return 'pipewire', command + ['-']
+    # Old pw-record (including Ubuntu 22.04's 0.3.48) cannot produce this
+    # raw PCM stream. PulseAudio clients also work with pipewire-pulse.
+    if shutil.which('parec'):
+        command = ['parec', '--raw', '--rate=16000', '--channels=1',
+                   '--format=s16le', '--latency-msec=20',
+                   '--client-name=WeTypeX', '--stream-name=voice']
+        if selected:
+            command += ['--device=' + str(microphone)]
+        return 'pulse', command
+    if shutil.which('ffmpeg'):
+        return 'ffmpeg-pulse', [
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-f', 'pulse', '-sample_rate', '16000', '-channels', '1',
+            '-fragment_size', '640', '-i', str(microphone) if selected else 'default',
+            '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1']
+    raise RuntimeError('需要支持原始音频的 pw-record、parec 或 FFmpeg')
 
 
 class Backend:
@@ -175,6 +219,7 @@ class Job:
         self.request = request
         self.config = read_json(CONFIG)
         self.capture = None
+        self.capture_backend = ''
         self.reader = None
         self.backend = None
         self.cancelled = False
@@ -257,19 +302,14 @@ class Job:
                 return
             recording_log = (VOICE / 'capture.log').open('wb')
             if self.request.get('file'):
+                self.capture_backend = 'file'
                 command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error']
                 if self.request.get('realtime'):
                     command += ['-re']
                 command += ['-protocol_whitelist', 'file,pipe', '-i', self.request['file'],
                             '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1']
             else:
-                command = ['pw-record', '--raw', '--rate', '16000', '--channels', '1',
-                           '--format', 's16', '--latency', '20ms', '--properties',
-                           'application.name=WeTypeX node.name=wetypex-voice-input']
-                microphone = self.config.get('voice_microphone', '自动检测')
-                if microphone and microphone != '自动检测':
-                    command += ['--target', str(microphone)]
-                command += ['-']
+                self.capture_backend, command = microphone_command(self.config)
             self.capture = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=recording_log)
             self.timing['capture_started_ms'] = round((time.monotonic() - self.since) * 1000)
             self.timing['capture_from_key_ms'] = round((time.monotonic() - self.requested) * 1000)
@@ -347,7 +387,9 @@ class Service:
                 state = 'polishing'
             self.latest = dict(version=time.monotonic_ns(), daemon_pid=os.getpid(),
                                token=job.token, session=job.session,
-                               epoch=job.epoch, state=state, text=text, timings=dict(job.timing), **extra)
+                               epoch=job.epoch, state=state, text=text,
+                               capture_backend=job.capture_backend,
+                               timings=dict(job.timing), **extra)
             self.last_activity = time.monotonic()
             self.last_native_activity = self.last_activity
             if job.session:
