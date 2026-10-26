@@ -24,6 +24,7 @@
 #include <QMovie>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -922,11 +923,52 @@ int main(int argc, char **argv) {
         microphone->addItem(name, target);
     }
   }
+  if (microphone->count() == 1) {
+    // PulseAudio 13 (Ubuntu 20.04) has no JSON output. Keep the text keys
+    // stable across desktop languages when querying older audio servers.
+    QProcess pulse;
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
+    pulse.setProcessEnvironment(environment);
+    pulse.start(QStringLiteral("pactl"), {QStringLiteral("list"),
+                                        QStringLiteral("sources")});
+    if (pulse.waitForFinished(2000) && pulse.exitCode() == 0) {
+      QString target, description;
+      bool monitor = false;
+      auto addSource = [&] {
+        if (!target.isEmpty() && !monitor)
+          microphone->addItem(description.isEmpty() ? target : description,
+                              target);
+      };
+      const auto lines = QString::fromUtf8(pulse.readAllStandardOutput())
+                             .split(QLatin1Char('\n'));
+      for (const auto &line : lines) {
+        const auto field = line.trimmed();
+        if (line.startsWith(QStringLiteral("Source #"))) {
+          addSource();
+          target.clear();
+          description.clear();
+          monitor = false;
+        } else if (field.startsWith(QStringLiteral("Name: "))) {
+          target = field.mid(6);
+        } else if (field.startsWith(QStringLiteral("Description: "))) {
+          description = field.mid(13);
+        } else if (field.startsWith(QStringLiteral("Monitor of Sink: "))) {
+          monitor = field.mid(17) != QStringLiteral("n/a");
+        }
+      }
+      addSource();
+    }
+  }
   const auto savedMicrophone = settings.value("voice_microphone").toString();
-  if (!savedMicrophone.isEmpty()) {
-    const int index = microphone->findData(savedMicrophone);
-    if (index >= 0)
-      microphone->setCurrentIndex(index);
+  if (!savedMicrophone.isEmpty() && savedMicrophone != QStringLiteral("自动检测")) {
+    int index = microphone->findData(savedMicrophone);
+    if (index < 0) {
+      microphone->addItem(savedMicrophone + QStringLiteral("（当前不可用）"),
+                          savedMicrophone);
+      index = microphone->count() - 1;
+    }
+    microphone->setCurrentIndex(index);
   }
   QObject::connect(
       microphone, qOverload<int>(&QComboBox::currentIndexChanged), [microphone](int index) {
