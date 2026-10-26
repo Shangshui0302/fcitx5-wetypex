@@ -2491,6 +2491,19 @@ public:
       return;
     }
     bool composing = !s->preedit.empty() || s->vMenu != VMenu::None;
+    auto typeCharacter = [&](char character) {
+      s->symbolAutoState = 0;
+      std::string text(1, character);
+      s->cursor = std::min(s->cursor, s->preedit.size());
+      s->preedit.insert(s->cursor, text);
+      ++s->cursor;
+      clearDisplayState(s);
+      if (networkEnabled_ && character != '\'')
+        s->cloudPollUntil = now(CLOCK_MONOTONIC) + 8000000;
+      send(ic, "key", text);
+      panel(ic, s);
+      e.filterAndAccept();
+    };
     if (!composing)
       recordClipboard(ic);
     if (failed_) {
@@ -2503,6 +2516,18 @@ public:
         panel(ic, s);
         e.filterAndAccept();
       }
+      return;
+    }
+    // These original double-pinyin profiles assign ';' to ing. Give that
+    // spelling key priority over punctuation and candidate shortcuts.
+    const auto doubleScheme = *config_.input->doublePinyin;
+    if (composing && !s->vMode && s->vMenu == VMenu::None &&
+        sym == FcitxKey_semicolon &&
+        *config_.input->mode == wetype_config::InputMode::DoublePinyin &&
+        (doubleScheme == wetype_config::DoublePinyinScheme::Sogou ||
+         doubleScheme == wetype_config::DoublePinyinScheme::Microsoft ||
+         doubleScheme == wetype_config::DoublePinyinScheme::Ziguang)) {
+      typeCharacter(';');
       return;
     }
     bool pageDown =
@@ -2812,18 +2837,7 @@ public:
       return;
     }
     if (lower || upper || separator) {
-      s->symbolAutoState = 0;
-      std::string text(1, asciiChar);
-      s->cursor = std::min(s->cursor, s->preedit.size());
-      s->preedit.insert(s->cursor, text);
-      ++s->cursor;
-      clearDisplayState(s);
-      // New cores push asynchronous candidates; older ones retain polling.
-      if ((lower || upper) && networkEnabled_ && !backendUpdates_)
-        s->cloudPollUntil = now(CLOCK_MONOTONIC) + 8000000;
-      send(ic, "key", text);
-      panel(ic, s);
-      e.filterAndAccept();
+      typeCharacter(asciiChar);
     }
   }
 };
