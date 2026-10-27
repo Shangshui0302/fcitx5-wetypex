@@ -137,7 +137,10 @@ class Backend:
         # This process outlives the recording thread that creates it.
         # --die-with-parent also triggers when that *thread* exits; stdin EOF
         # already shuts down the voice service when the controller exits.
-        command = ['bwrap', '--unshare-pid',
+        wrapper = shutil.which('bwrap')
+        if not wrapper:
+            raise RuntimeError('请先安装 Bubblewrap')
+        command = [wrapper, '--unshare-pid',
                    '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib',
                    '--ro-bind', '/lib64', '/lib64', '--symlink', 'usr/bin', '/bin',
                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
@@ -146,7 +149,7 @@ class Backend:
         for path in ('/etc/ssl', '/etc/pki', '/etc/ca-certificates'):
             command += ['--ro-bind-try', path, path]
         command += ['--ro-bind', str(RUNTIME), '/input', '--ro-bind', str(SUPPORT), '/support',
-                    '--bind', str(directory), '/work', '--chdir', '/work', '--clearenv',
+                    '--bind', str(directory), '/work', '--chdir', '/work',
                     '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/work',
                     '--setenv', 'WETYPE_SUPPORT_DIR', '/support',
                     '--setenv', 'WETYPE_WORK_DIR', '/work/business',
@@ -159,7 +162,7 @@ class Backend:
         command += ['/support/wetypex-engine-host', '/input', 'voice-service']
         self.log = (VOICE / 'backend.log').open('wb')
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=self.log, bufsize=65536)
+                                        stderr=self.log, bufsize=65536, env={})
         os.set_blocking(self.process.stdin.fileno(), False)
         threading.Thread(target=self.receive, daemon=True).start()
 
