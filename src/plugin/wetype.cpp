@@ -225,6 +225,8 @@ struct State : InputContextProperty {
   char pendingPairKey = 0;
   std::string pendingPairRight;
   uint8_t symbolAutoState = 0;
+  std::string pendingNumericText, pendingNumericReplacement;
+  uint64_t pendingNumericUntil = 0;
   bool doubleQuoteLeft = true, singleQuoteLeft = true;
   bool english = false, fullWidth = false, traditional = false,
        englishPunctuation = false, vMode = false, vCalculator = false;
@@ -282,8 +284,9 @@ class WeType : public InputMethodEngine {
   pid_t child_ = -1;
   int read_ = -1, write_ = -1;
   std::unique_ptr<EventSourceIO> reader_, writer_;
-  std::unique_ptr<EventSourceTime> timer_;
+  std::unique_ptr<EventSourceTime> timer_, numericTimer_;
   std::unique_ptr<HandlerTableEntry<EventHandler>> languageModifierWatcher_;
+  std::unique_ptr<HandlerTableEntry<EventHandler>> numericWatcher_;
   bool ready_ = false, failed_ = false, backendUpdates_ = false;
   uint64_t activity_ = 0;
   uint64_t restartAt_ = 0, restartBackoff_ = 250000;
@@ -375,17 +378,97 @@ class WeType : public InputMethodEngine {
     return byte >= 0 && size_t(byte) <= text.size() &&
            text.compare(size_t(byte), expected.size(), expected) == 0;
   }
-  static bool previousSurroundingTextIs(InputContext *ic,
-                                        const std::string &expected) {
+  // Confirm the committed numeric suffix at the actual, unselected caret.
+  static bool previousNumericTextIs(InputContext *ic,
+                                    const std::string &expected) {
     const auto &surrounding = ic->surroundingText();
     if (!surrounding.isValid() || surrounding.cursor() != surrounding.anchor())
       return false;
     const auto &text = surrounding.text();
     auto byte = utf8::ncharByteLength(text.begin(), surrounding.cursor());
     return byte >= 0 && size_t(byte) <= text.size() &&
-           size_t(byte) >= expected.size() &&
+           size_t(byte) > expected.size() &&
+           text[size_t(byte) - expected.size() - 1] >= '0' &&
+           text[size_t(byte) - expected.size() - 1] <= '9' &&
            text.compare(size_t(byte) - expected.size(), expected.size(),
                         expected) == 0;
+  }
+  static const char *numericPunctuation(char ascii) {
+    return ascii == ':' ? "：" : ascii == ',' ? "，" : "。";
+  }
+  static void clearNumericCorrection(State *s) {
+    s->pendingNumericText.clear();
+    s->pendingNumericReplacement.clear();
+    s->pendingNumericUntil = 0;
+  }
+  static char numericReplacement(uint8_t state) {
+    return state == 1 ? ':' : state == 2 ? ',' : state == 4 ? '.' : 0;
+  }
+  static void appendNumericCorrection(State *s, const std::string &text) {
+    if (s->pendingNumericText.empty())
+      return;
+    if (s->pendingNumericText.size() + text.size() > 1024) {
+      clearNumericCorrection(s);
+      return;
+    }
+    s->pendingNumericText += text;
+    s->pendingNumericReplacement += text;
+  }
+  static bool numericKeyTransport(InputContext *ic) {
+    return std::string_view(ic->frontend()) == "dbus";
+  }
+  static void deliverNumericText(InputContext *ic, const std::string &text) {
+    if (!numericKeyTransport(ic)) {
+      ic->commitString(text);
+      return;
+    }
+    // Qt's D-Bus client can temporarily discard its surrounding-text cache
+    // while still reporting the document. Keep this path on ordered keys.
+    std::string_view remaining(text);
+    while (!remaining.empty()) {
+      const auto scalar = utf8::getChar(remaining.begin(), remaining.end());
+      const Key key(Key::keySymFromUnicode(scalar));
+      ic->forwardKey(key);
+      ic->forwardKey(key, true);
+      remaining.remove_prefix(firstUtf8Size(remaining));
+    }
+  }
+  void scheduleNumericCorrection() {
+    if (!numericTimer_)
+      return;
+    const auto wake = now(CLOCK_MONOTONIC) + 1;
+    if (!numericTimer_->isEnabled() || numericTimer_->time() > wake)
+      numericTimer_->setTime(wake);
+    numericTimer_->setEnabled(true);
+  }
+  void resolveNumericCorrection(InputContext *ic, State *s) {
+    if (s->pendingNumericText.empty())
+      return;
+    if (!s->active || !ic->hasFocus() || !symbolAutoChange_ || s->english ||
+        s->englishPunctuation || s->fullWidth || !chinesePunctuation_ ||
+        voicePending_ || s->vMode || s->vMenu != VMenu::None ||
+        !s->preedit.empty() ||
+        ic->capabilityFlags().test(CapabilityFlag::Password) ||
+        ic->capabilityFlags().test(CapabilityFlag::Sensitive) ||
+        now(CLOCK_MONOTONIC) > s->pendingNumericUntil) {
+      clearNumericCorrection(s);
+      return;
+    }
+    const auto &expected = s->pendingNumericText;
+    if (!previousNumericTextIs(ic, expected))
+      return;
+    const auto replacement = s->pendingNumericReplacement;
+    const int length = int(utf8::length(expected));
+    clearNumericCorrection(s);
+    if (numericKeyTransport(ic)) {
+      for (int i = 0; i < length; ++i) {
+        ic->forwardKey(Key(FcitxKey_BackSpace));
+        ic->forwardKey(Key(FcitxKey_BackSpace), true);
+      }
+    } else {
+      ic->deleteSurroundingText(-length, length);
+    }
+    deliverNumericText(ic, replacement);
   }
   std::string mappedSymbol(State *s, char ascii, bool asciiMode) const {
     const auto *entry = punctuationEntry(ascii);
@@ -432,31 +515,52 @@ class WeType : public InputMethodEngine {
       s->symbolAutoState = 0;
       return true;
     }
+    const bool autoChangeActive = symbolAutoChange_ && !asciiMode &&
+                                  !s->englishPunctuation &&
+                                  chinesePunctuation_ && !s->fullWidth;
+    const bool numeric = autoChangeActive &&
+                         (s->symbolAutoState || !s->pendingNumericText.empty());
+    auto emit = [&](const std::string &value) {
+      if (numeric)
+        deliverNumericText(ic, value);
+      else
+        ic->commitString(value);
+    };
     std::string mapped = mappedSymbol(s, ascii, asciiMode);
+    if (autoChangeActive && !entry->pairType)
+      appendNumericCorrection(s, mapped);
     auto [left, right] = splitPair(mapped);
     if (entry->pairType && !right.empty()) {
       if (*config_.input->symbolAutoPair) {
-        commitStringAtCursor(ic, mapped, 1);
+        if (numeric && numericKeyTransport(ic)) {
+          emit(mapped);
+          for (size_t i = 1; i < utf8::length(mapped); ++i) {
+            ic->forwardKey(Key(FcitxKey_Left));
+            ic->forwardKey(Key(FcitxKey_Left), true);
+          }
+        } else {
+          commitStringAtCursor(ic, mapped, 1);
+        }
         s->pendingPairKey = closingKey(ascii);
         s->pendingPairRight = right;
       } else if (entry->pairType == 2) {
         bool &leftNext =
             ascii == '\"' ? s->doubleQuoteLeft : s->singleQuoteLeft;
-        ic->commitString(leftNext ? left : right);
+        emit(leftNext ? left : right);
         leftNext = !leftNext;
       } else {
-        ic->commitString(left);
+        emit(left);
       }
     } else {
-      ic->commitString(mapped);
+      emit(mapped);
     }
-    const bool autoChangeActive = symbolAutoChange_ && !asciiMode &&
-                                  !s->englishPunctuation &&
-                                  chinesePunctuation_ && !s->fullWidth;
+
     if (autoChangeActive && s->symbolAutoState == 3 && ascii == ':')
       s->symbolAutoState = 1;
     else if (autoChangeActive && s->symbolAutoState == 3 && ascii == ',')
       s->symbolAutoState = 2;
+    else if (autoChangeActive && s->symbolAutoState == 3 && ascii == '.')
+      s->symbolAutoState = 4;
     else
       s->symbolAutoState = 0;
     return true;
@@ -1600,9 +1704,10 @@ class WeType : public InputMethodEngine {
         s->appliedUpdate = 0;
         s->initialPanelDeadline = 0;
         s->initialPanelShown = false;
+        clearNumericCorrection(s);
         s->selectionPending = false;
         s->deferredKeys.clear();
-        s->modifierCandidate = FcitxKey_None;
+        s->modifierCandidate = Key();
         s->preedit.clear();
         s->cursor = 0;
         clearDisplayState(s);
@@ -2043,6 +2148,34 @@ public:
           keyEvent(*entry, key);
           key.filterAndAccept();
         });
+    numericWatcher_ = instance_->watchEvent(
+        EventType::InputContextSurroundingTextUpdated, EventWatcherPhase::Default,
+        [this](Event &event) {
+          auto *ic = static_cast<InputContextEvent &>(event).inputContext();
+          const auto *entry = instance_->inputMethodEntry(ic);
+          if (entry && entry->uniqueName() == "wetypex" &&
+              !state(ic)->pendingNumericText.empty())
+            scheduleNumericCorrection();
+        });
+    // Old Fcitx emits deletes immediately but queues key-event commits.
+    // Correct text outside that key transaction and retry while the client
+    // acknowledges its recently inserted numeric text.
+    numericTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 1000,
+        [this](auto *source, uint64_t) {
+          bool retry = false;
+          for (auto &[id, ref] : contexts_)
+            if (auto *ic = ref.get()) {
+              auto *s = ic->propertyFor(&factory_);
+              resolveNumericCorrection(ic, s);
+              retry |= !s->pendingNumericText.empty();
+            }
+          if (retry)
+            source->setTime(now(CLOCK_MONOTONIC) + 2000);
+          source->setEnabled(retry);
+          return true;
+        });
+    numericTimer_->setEnabled(false);
     timer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 100000, 0,
         [this](auto *source, uint64_t time) {
@@ -2148,6 +2281,8 @@ public:
   ~WeType() override {
     cancelVoice();
     languageModifierWatcher_.reset();
+    numericWatcher_.reset();
+    numericTimer_.reset();
     timer_.reset();
     stop();
     stopSync();
@@ -2197,15 +2332,14 @@ public:
       stopVModeWindow(s->active ? "input context reset"
                                 : "input method deactivated");
     clearVMenu(s);
+    // A modifier release after a focus round trip must not toggle language.
     s->modifierCandidate = Key();
     s->selectionPending = false;
     s->deferredKeys.clear();
-    // A modifier press belongs to the current focus/composition lifetime.
-    // Its release after a focus round trip must not toggle the saved language.
-    s->modifierCandidate = FcitxKey_None;
     ++s->epoch;
     s->initialPanelDeadline = 0;
     s->initialPanelShown = false;
+    clearNumericCorrection(s);
     s->preedit.clear();
     s->cursor = 0;
     clearDisplayState(s);
@@ -2349,6 +2483,7 @@ public:
     }
     s->english = !s->english;
     s->symbolAutoState = 0;
+    clearNumericCorrection(s);
     s->modifierCandidate = Key();
     ic->inputPanel().reset();
     panel(ic, s);
@@ -2364,6 +2499,18 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    if (!e.isRelease() && !s->pendingNumericText.empty()) {
+      const auto commands = key.states().toInteger() &
+                            uint32_t(KeyState::SimpleMask) &
+                            ~uint32_t(KeyState::Shift);
+      const bool numeric = sym >= FcitxKey_0 && sym <= FcitxKey_9;
+      const auto *symbol = sym >= 0x20 && sym <= 0x7e
+                               ? punctuationEntry(char(sym)) : nullptr;
+      const bool continuation = (symbol && !symbol->pairType) || sym == FcitxKey_space ||
+                                sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
+      if (commands || (!numeric && !continuation))
+        clearNumericCorrection(s);
+    }
     if (networkEnabled_ && e.rawKey().states().test(KeyState::Repeat) &&
         ((*config_.voice->launchShortcut &&
           key.checkKeyList(*config_.voice->launchKey)) ||
@@ -2577,7 +2724,8 @@ public:
       s->preedit.insert(s->cursor, text);
       ++s->cursor;
       clearDisplayState(s);
-      if (networkEnabled_ && character != '\'')
+      // New cores push asynchronous candidates; older ones retain polling.
+      if (networkEnabled_ && !backendUpdates_ && character != '\'')
         s->cloudPollUntil = now(CLOCK_MONOTONIC) + 8000000;
       send(ic, "key", text);
       panel(ic, s);
@@ -2857,23 +3005,54 @@ public:
     const auto *entry = ascii ? punctuationEntry(asciiChar) : nullptr;
 
     // SymbolAutoChangedHelper in the desktop implementation delays numeric
-    // punctuation correction.  A colon/comma after a digit is displayed in
+    // punctuation correction. Numeric punctuation is displayed in
     // Chinese form first; only another digit changes it back to ASCII.
     const bool autoChangeActive = symbolAutoChange_ && !composing &&
                                   !s->englishPunctuation &&
                                   chinesePunctuation_ && !s->fullWidth;
+    if (autoChangeActive && sym == FcitxKey_space &&
+        (s->symbolAutoState || !s->pendingNumericText.empty())) {
+      appendNumericCorrection(s, " ");
+      s->symbolAutoState = 0;
+      deliverNumericText(ic, " ");
+      e.filterAndAccept();
+      return;
+    }
     if (!composing && digit && autoChangeActive) {
-      if (s->symbolAutoState == 1 || s->symbolAutoState == 2) {
-        const char replacement = s->symbolAutoState == 1 ? ':' : ',';
-        if (previousSurroundingTextIs(ic, replacement == ':' ? "：" : "，")) {
-          ic->deleteSurroundingText(-1, 1);
-          ic->commitString(std::string(1, replacement) + asciiChar);
-          s->symbolAutoState = 3;
-          e.filterAndAccept();
-          return;
+      const char replacement = numericReplacement(s->symbolAutoState);
+      if (!s->pendingNumericText.empty()) {
+        if (replacement) {
+          const std::string previous = numericPunctuation(replacement);
+          auto &text = s->pendingNumericReplacement;
+          if (text.size() >= previous.size() &&
+              text.compare(text.size() - previous.size(), previous.size(),
+                           previous) == 0)
+            text.replace(text.size() - previous.size(), previous.size(), 1,
+                         replacement);
+        }
+        appendNumericCorrection(s, std::string(1, asciiChar));
+      } else if (replacement) {
+        const char *previous = numericPunctuation(replacement);
+        // Wayland clients may acknowledge committed punctuation after the
+        // next digit. Observe that exact suffix without delaying any keys.
+        if ((ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
+             numericKeyTransport(ic)) &&
+            !ic->capabilityFlags().test(CapabilityFlag::Sensitive) &&
+            ic->surroundingText().isValid() &&
+            ic->surroundingText().cursor() == ic->surroundingText().anchor()) {
+          s->pendingNumericText = std::string(previous) + asciiChar;
+          s->pendingNumericReplacement = std::string(1, replacement) + asciiChar;
+          s->pendingNumericUntil = now(CLOCK_MONOTONIC) + 250000;
         }
       }
       s->symbolAutoState = 3;
+      // Keep digits and punctuation on the same ordered text channel.
+      // Raw key forwarding can otherwise overtake a Wayland commit.
+      deliverNumericText(ic, std::string(1, asciiChar));
+      if (!s->pendingNumericText.empty())
+        scheduleNumericCorrection();
+      e.filterAndAccept();
+      return;
     } else if (!composing && (!entry || !autoChangeActive)) {
       s->symbolAutoState = 0;
     }
