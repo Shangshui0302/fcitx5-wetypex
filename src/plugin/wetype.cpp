@@ -236,7 +236,7 @@ struct State : InputContextProperty {
   std::string vMenuTitle;
   std::vector<std::pair<std::string, std::string>> vMenuEntries;
   bool active = false;
-  KeySym modifierCandidate = FcitxKey_None;
+  Key modifierCandidate;
   TrackableObjectReference<InputContext> ic;
   State(uint64_t n, InputContext &context) : id(n), ic(context.watch()) {}
 };
@@ -334,7 +334,6 @@ class WeType : public InputMethodEngine {
     syncChild_ = -1;
   }
   int pageSize_ = 5;
-  int keyboard_ = 0;
   bool vertical_ = false, chinesePunctuation_ = true, slashPunctuation_ = true,
        symbolAutoChange_ = true, clipboardEnabled_ = false,
        networkEnabled_ = true;
@@ -477,7 +476,6 @@ class WeType : public InputMethodEngine {
       return value ? bool(json_object_get_boolean(value)) : fallback;
     };
     pageSize_ = std::clamp(int(wire::number(j.get(), "page_size", 5)), 3, 9);
-    keyboard_ = wire::number(j.get(), "keyboard", 0) == 5 ? 5 : 0;
     vertical_ = json_object_get_boolean(wire::get(j.get(), "vertical"));
     auto *punctuation = wire::get(j.get(), "chinese_punctuation");
     chinesePunctuation_ = !punctuation || json_object_get_boolean(punctuation);
@@ -491,7 +489,9 @@ class WeType : public InputMethodEngine {
         !json_object_get_boolean(wire::get(j.get(), "standalone"));
     auto *input = config_.input.mutableValue();
     auto mode = wire::str(j.get(), "input_mode");
-    input->mode.setValue(mode == "wubi" ? wetype_config::InputMode::Wubi
+    input->mode.setValue((mode == "wubi" ||
+                         (mode.empty() && wire::number(j.get(), "keyboard") == 5))
+                            ? wetype_config::InputMode::Wubi
                          : mode == "double_pinyin"
                              ? wetype_config::InputMode::DoublePinyin
                              : wetype_config::InputMode::Pinyin);
@@ -1754,8 +1754,9 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "pair_cursor", int64_t(pairCursor));
     wire::put(json.get(), "before", op == std::string("predict") ? key : "");
     wire::put(json.get(), "chinese_punctuation", int64_t(chinesePunctuation_));
-    wire::put(json.get(), "keyboard", int64_t(keyboard_));
     const auto &inputConfig = *config_.input;
+    wire::put(json.get(), "keyboard",
+              int64_t(*inputConfig.mode == wetype_config::InputMode::Wubi ? 5 : 0));
     static const int doubleSchemes[] = {5, 1, 2, 3, 4, 6, 7};
     wire::put(
         json.get(), "double_scheme",
@@ -1780,7 +1781,9 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "large_emoji",
               bool(*inputConfig.largeEmoji) && wechat);
     wire::put(json.get(), "symbol_emoji", bool(*inputConfig.symbolEmoji));
-    wire::put(json.get(), "v_mode", bool(*config_.shortcuts->vMode));
+    wire::put(json.get(), "v_mode",
+              bool(*config_.shortcuts->vMode) &&
+                  *config_.input->mode == wetype_config::InputMode::Pinyin);
     wire::put(json.get(), "fuzzy_nl", bool(*inputConfig.fuzzyNl));
     wire::put(json.get(), "fuzzy_rl", bool(*inputConfig.fuzzyRl));
     wire::put(json.get(), "fuzzy_hf", bool(*inputConfig.fuzzyHf));
@@ -1994,31 +1997,48 @@ public:
                                    &instance_->userInterfaceManager());
     settingsConnection_ = settingsAction_.connect<SimpleAction::Activated>(
         [](InputContext *) { startProcess({WETYPE_SETTINGS}); });
-    // Fcitx's default AltTriggerKeys contains Shift_L and runs before the
-    // engine. Own enabled language modifiers here so unfinished input reaches
-    // our ordered raw-commit path rather than being reset by a global switch.
+    // Fcitx global triggers run before the engine. Own explicitly configured
+    // shortcuts and bare language modifiers so their ordered commits survive.
     languageModifierWatcher_ = instance_->watchEvent(
         EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
         [this](Event &event) {
           auto &key = static_cast<KeyEvent &>(event);
-          const auto sym = key.key().sym();
-          const bool enabled =
-              ((sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) &&
-               *config_.shortcuts->shiftSwitch) ||
-              ((sym == FcitxKey_Control_L || sym == FcitxKey_Control_R) &&
-               *config_.shortcuts->ctrlSwitch);
-          // Leave multi-modifier shortcuts (e.g. Alt+Shift and the voice
-          // shortcut) to their normal handlers. Only own the bare modifier.
-          const auto otherModifiers =
-              key.key().states().toInteger() & uint32_t(KeyState::SimpleMask) &
-              ~Key::keySymToStates(sym).toInteger();
-          if (!enabled || key.filtered() || otherModifiers)
+          if (key.filtered())
             return;
           auto *ic = key.inputContext();
           auto *entry = instance_->inputMethodEntry(ic);
           if (!entry || entry->uniqueName() != "wetypex" ||
               !state(ic)->active ||
               ic->capabilityFlags().test(CapabilityFlag::Password))
+            return;
+          auto *s = state(ic);
+          const auto sym = key.key().sym();
+          const bool explicitGlobalModifier = std::any_of(
+              instance_->globalConfig().altTriggerKeys().begin(),
+              instance_->globalConfig().altTriggerKeys().end(),
+              [&](const Key &candidate) {
+                return candidate.isModifier() && !bareModifier(candidate) &&
+                       (key.key().check(candidate) ||
+                        key.key().isReleaseOfModifier(candidate));
+              });
+          // Fcitx 5.0 can match its bare Shift trigger on a Ctrl+Shift
+          // release. Own those component events as well, while preserving
+          // an explicitly configured global modifier chord.
+          const bool languageModifier =
+              !explicitGlobalModifier &&
+              (((sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) &&
+                *config_.shortcuts->shiftSwitch) ||
+               ((sym == FcitxKey_Control_L || sym == FcitxKey_Control_R) &&
+                *config_.shortcuts->ctrlSwitch));
+          const bool pendingSwitch =
+              key.isRelease() && s->modifierCandidate.isModifier() &&
+              languageSwitchKey(s->modifierCandidate) &&
+              key.key().isReleaseOfModifier(s->modifierCandidate);
+          const bool compositionShortcut =
+              !s->english && (!s->preedit.empty() || s->vMenu != VMenu::None) &&
+              !key.key().isModifier() && compositionShortcutKey(key.key());
+          if (!languageModifier && !languageSwitchKey(key.key()) && !pendingSwitch &&
+              !compositionShortcut)
             return;
           keyEvent(*entry, key);
           key.filterAndAccept();
@@ -2177,6 +2197,7 @@ public:
       stopVModeWindow(s->active ? "input context reset"
                                 : "input method deactivated");
     clearVMenu(s);
+    s->modifierCandidate = Key();
     s->selectionPending = false;
     s->deferredKeys.clear();
     // A modifier press belongs to the current focus/composition lifetime.
@@ -2278,11 +2299,69 @@ public:
     }
     return false;
   }
+  static bool bareModifier(const Key &key) {
+    return key.isModifier() &&
+           !(key.states().toInteger() & uint32_t(KeyState::SimpleMask) &
+             ~Key::keySymToStates(key.sym()).toInteger());
+  }
+  bool languageSwitchKey(const Key &key) const {
+    if (bareModifier(key)) {
+      if (key.sym() == FcitxKey_Shift_L || key.sym() == FcitxKey_Shift_R)
+        return *config_.shortcuts->shiftSwitch;
+      if (key.sym() == FcitxKey_Control_L || key.sym() == FcitxKey_Control_R)
+        return *config_.shortcuts->ctrlSwitch;
+    }
+    return key.checkKeyList(*config_.shortcuts->languageSwitchKeys);
+  }
+  bool compositionShortcutKey(const Key &key) const {
+    return key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
+           key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
+           key.checkKeyList(*config_.shortcuts->secondCandidateKeys) ||
+           key.checkKeyList(*config_.shortcuts->thirdCandidateKeys) ||
+           key.checkKeyList(instance_->globalConfig().defaultPrevPage()) ||
+           key.checkKeyList(instance_->globalConfig().defaultNextPage()) ||
+           key.checkKeyList(instance_->globalConfig().defaultPrevCandidate()) ||
+           key.checkKeyList(instance_->globalConfig().defaultNextCandidate());
+  }
+  void switchLanguage(InputContext *ic, State *s) {
+    if (s->vMode)
+      cancelVMode(ic);
+    // The queued raw commit must finish before later typing uses the new
+    // language, even when the core has not returned the last letter yet.
+    if (!s->preedit.empty() || s->inputSeq > s->applied) {
+      if (send(ic, "raw")) {
+        s->selectionPending = true;
+        ic->inputPanel().setCandidateList(nullptr);
+      } else {
+        if (!s->preedit.empty())
+          ic->commitString(s->preedit);
+        ++s->epoch;
+        s->selectionPending = false;
+        s->deferredKeys.clear();
+        s->preedit.clear();
+        s->cursor = 0;
+        clearDisplayState(s);
+      }
+    } else {
+      s->preedit.clear();
+      s->cursor = 0;
+      clearDisplayState(s);
+    }
+    s->english = !s->english;
+    s->symbolAutoState = 0;
+    s->modifierCandidate = Key();
+    ic->inputPanel().reset();
+    panel(ic, s);
+  }
   void keyEvent(const InputMethodEntry &, KeyEvent &e) override {
     auto key = e.key();
     auto *ic = e.inputContext();
     auto *s = state(ic);
     auto sym = key.sym();
+    // Key::isDigit() only gained keypad support in Fcitx 5.0.20. Normalize
+    // these symbols locally so the 5.0.14 baseline selects the same words.
+    if (sym >= FcitxKey_KP_0 && sym <= FcitxKey_KP_9)
+      sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
     if (networkEnabled_ && e.rawKey().states().test(KeyState::Repeat) &&
@@ -2301,14 +2380,18 @@ public:
       e.filterAndAccept();
       return;
     }
-    const bool shiftModifier =
-        sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
     const bool ctrlModifier =
         sym == FcitxKey_Control_L || sym == FcitxKey_Control_R;
     if (e.isRelease()) {
+      const auto pressed = s->modifierCandidate;
+      const bool releasedModifier = pressed.isModifier() &&
+                                    key.isReleaseOfModifier(pressed);
       auto releasedConfiguredKey = [&](const KeyList &keys) {
         return std::any_of(keys.begin(), keys.end(), [&](const Key &candidate) {
-          return sym == candidate.sym() || key.isReleaseOfModifier(candidate);
+          return candidate.isModifier() ? key.isReleaseOfModifier(candidate)
+              : sym == candidate.sym() ||
+                    (candidate.states().toInteger() &
+                     Key::keySymToStates(sym).toInteger());
         });
       };
       if (voiceRecording_ && voiceHold_ &&
@@ -2317,67 +2400,34 @@ public:
         e.filterAndAccept();
         return;
       }
-      if (!s->preedit.empty() && s->modifierCandidate == sym &&
-          ((*config_.shortcuts->selectCtrl && ctrlModifier) ||
-           releasedConfiguredKey(*config_.shortcuts->secondCandidateKeys) ||
-           releasedConfiguredKey(*config_.shortcuts->thirdCandidateKeys))) {
+      const bool selectCtrl = *config_.shortcuts->selectCtrl &&
+                              bareModifier(pressed) &&
+                              (pressed.sym() == FcitxKey_Control_L ||
+                               pressed.sym() == FcitxKey_Control_R);
+      if (!s->preedit.empty() && releasedModifier &&
+          (selectCtrl ||
+           pressed.checkKeyList(*config_.shortcuts->secondCandidateKeys) ||
+           pressed.checkKeyList(*config_.shortcuts->thirdCandidateKeys))) {
         const bool third =
-            sym == FcitxKey_Control_R ||
-            releasedConfiguredKey(*config_.shortcuts->thirdCandidateKeys);
+            (selectCtrl && pressed.sym() == FcitxKey_Control_R) ||
+            pressed.checkKeyList(*config_.shortcuts->thirdCandidateKeys);
         const unsigned pageIndex = third ? 2 : 1;
         selectByKey(ic, pageIndex);
-        s->modifierCandidate = FcitxKey_None;
+        s->modifierCandidate = Key();
         e.filterAndAccept();
         return;
       }
-      const bool configuredLanguageSwitch =
-          releasedConfiguredKey(*config_.shortcuts->languageSwitchKeys) &&
-          ((!shiftModifier && !ctrlModifier) ||
-           (shiftModifier && *config_.shortcuts->shiftSwitch) ||
-           (ctrlModifier && *config_.shortcuts->ctrlSwitch));
-      if (s->modifierCandidate == sym &&
-          ((shiftModifier && *config_.shortcuts->shiftSwitch) ||
-           (ctrlModifier && *config_.shortcuts->ctrlSwitch) ||
-           configuredLanguageSwitch)) {
-        if (s->vMode)
-          cancelVMode(ic);
-        // Preserve unfinished pinyin when Shift switches to English. The
-        // backend receives this after earlier key requests and retains their
-        // literal text, even before Fcitx receives the latest preedit reply.
-        if (!s->preedit.empty() || s->inputSeq > s->applied) {
-          if (send(ic, "raw")) {
-            // Keep the current preedit visible until the asynchronous raw
-            // commit arrives, and queue later keys behind that commit.
-            s->selectionPending = true;
-            ic->inputPanel().setCandidateList(nullptr);
-          } else {
-            // If the backend cannot be started, do not discard the text we
-            // still have locally. Ignore any late replies from that session.
-            if (!s->preedit.empty())
-              ic->commitString(s->preedit);
-            ++s->epoch;
-            s->selectionPending = false;
-            s->deferredKeys.clear();
-            s->preedit.clear();
-            s->cursor = 0;
-            clearDisplayState(s);
-          }
-        } else {
-          s->preedit.clear();
-          s->cursor = 0;
-          clearDisplayState(s);
-        }
-        s->english = !s->english;
-        s->symbolAutoState = 0;
-        s->modifierCandidate = FcitxKey_None;
-        ic->inputPanel().reset();
-        panel(ic, s);
+      if (releasedModifier && languageSwitchKey(pressed)) {
+        switchLanguage(ic, s);
         e.filterAndAccept();
       }
+      if (releasedModifier)
+        s->modifierCandidate = Key();
       return;
     }
     if (networkEnabled_ && *config_.voice->launchShortcut &&
         key.checkKeyList(*config_.voice->launchKey)) {
+      s->modifierCandidate = Key();
       if (voiceRecording_ && voiceHold_)
         voiceHold_ = false;
       else if (voicePending_)
@@ -2389,6 +2439,7 @@ public:
     }
     if (networkEnabled_ && *config_.voice->holdShortcut &&
         key.checkKeyList(*config_.voice->holdKey)) {
+      s->modifierCandidate = Key();
       if (!voicePending_ && !flushBeforeVoice(ic, e))
         startVoice(ic, true);
       e.filterAndAccept();
@@ -2412,10 +2463,25 @@ public:
       cancelVoice();
     }
     if (key.isModifier()) {
-      s->modifierCandidate = sym;
+      // A modifier chord is a shortcut only when explicitly configured.
+      // Otherwise Ctrl+Shift must not arm the default bare-Shift switch.
+      s->modifierCandidate =
+          languageSwitchKey(key) ||
+                  (*config_.shortcuts->selectCtrl && ctrlModifier &&
+                   bareModifier(key)) ||
+                  key.checkKeyList(*config_.shortcuts->secondCandidateKeys) ||
+                  key.checkKeyList(*config_.shortcuts->thirdCandidateKeys)
+              ? key
+              : Key();
       return;
     }
-    s->modifierCandidate = FcitxKey_None;
+    s->modifierCandidate = Key();
+    if (languageSwitchKey(key)) {
+      if (!e.rawKey().states().test(KeyState::Repeat))
+        switchLanguage(ic, s);
+      e.filterAndAccept();
+      return;
+    }
     if (*config_.shortcuts->punctuationSwitch &&
         key.checkKeyList(*config_.shortcuts->punctuationSwitchKeys)) {
       s->englishPunctuation = !s->englishPunctuation;
@@ -2440,8 +2506,21 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (key.states().test(KeyState::Ctrl) || key.states().test(KeyState::Alt) ||
-        key.states().test(KeyState::Super))
+    const bool commandModifiers =
+        key.states().toInteger() & uint32_t(KeyState::SimpleMask) &
+        ~uint32_t(KeyState::Shift);
+    const bool hasComposition = !s->preedit.empty() || s->vMenu != VMenu::None;
+    const bool vModeKey = *config_.shortcuts->vMode &&
+                          *config_.input->mode ==
+                              wetype_config::InputMode::Pinyin &&
+                          key.checkKeyList(*config_.shortcuts->vModeKeys);
+    const bool idleShortcut =
+        !hasComposition &&
+        ((!s->english && vModeKey) ||
+         (networkEnabled_ && *config_.shortcuts->aiAssistant &&
+          key.checkKeyList(*config_.shortcuts->aiAssistantKeys)));
+    if (commandModifiers && !idleShortcut &&
+        !(hasComposition && compositionShortcutKey(key)))
       return;
     if (ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
@@ -2490,7 +2569,7 @@ public:
       }
       return;
     }
-    bool composing = !s->preedit.empty() || s->vMenu != VMenu::None;
+    bool composing = hasComposition;
     auto typeCharacter = [&](char character) {
       s->symbolAutoState = 0;
       std::string text(1, character);
@@ -2521,7 +2600,7 @@ public:
     // These original double-pinyin profiles assign ';' to ing. Give that
     // spelling key priority over punctuation and candidate shortcuts.
     const auto doubleScheme = *config_.input->doublePinyin;
-    if (composing && !s->vMode && s->vMenu == VMenu::None &&
+    if (composing && !commandModifiers && !s->vMode && s->vMenu == VMenu::None &&
         sym == FcitxKey_semicolon &&
         *config_.input->mode == wetype_config::InputMode::DoublePinyin &&
         (doubleScheme == wetype_config::DoublePinyinScheme::Sogou ||
@@ -2595,8 +2674,7 @@ public:
         composing = !s->preedit.empty();
       }
     }
-    if (!composing && !s->vMode && *config_.shortcuts->vMode &&
-        key.checkKeyList(*config_.shortcuts->vModeKeys)) {
+    if (!composing && !s->vMode && vModeKey) {
       // VModeV2 is armed by the core's pending-input callback for a literal
       // "v", then activated through SessionOptions 0x11.
       send(ic, "key", "v");
@@ -2707,7 +2785,8 @@ public:
          (*config_.shortcuts->selectSemicolonQuote &&
           (sym == FcitxKey_semicolon || sym == FcitxKey_apostrophe)))) {
       const unsigned pageIndex =
-          configuredSecond || sym == FcitxKey_semicolon ? 1 : 2;
+          configuredSecond ? 1 : configuredThird ? 2
+                               : sym == FcitxKey_semicolon ? 1 : 2;
       selectByKey(ic, pageIndex);
       e.filterAndAccept();
       return;
@@ -2720,6 +2799,8 @@ public:
         e.filterAndAccept();
       return;
     }
+    if (commandModifiers)
+      return;
     if (composing && sym == FcitxKey_BackSpace) {
       s->cursor = std::min(s->cursor, s->preedit.size());
       if (s->cursor) {
@@ -2800,7 +2881,8 @@ public:
     // The original desktop treats apostrophe as a pinyin separator while a
     // composition exists. Outside a composition it follows the quote-pair
     // entry in punctuation.json.
-    const bool separator = composing && sym == FcitxKey_apostrophe;
+    const bool separator = composing && sym == FcitxKey_apostrophe &&
+                           *config_.input->mode != wetype_config::InputMode::Wubi;
     if (!composing && s->fullWidth &&
         (upper || digit || sym == FcitxKey_space)) {
       const uint32_t full = sym == FcitxKey_space ? 0x3000 : sym + 0xfee0;
