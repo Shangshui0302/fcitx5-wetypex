@@ -228,6 +228,7 @@ struct State : InputContextProperty {
   bool doubleQuoteLeft = true, singleQuoteLeft = true;
   bool english = false, fullWidth = false, traditional = false,
        englishPunctuation = false, vMode = false, vCalculator = false;
+  bool languageInitialized = false;
   bool selectionPending = false;
   std::vector<DeferredKey> deferredKeys;
   VMenu vMenu = VMenu::None;
@@ -1601,6 +1602,7 @@ class WeType : public InputMethodEngine {
         s->initialPanelShown = false;
         s->selectionPending = false;
         s->deferredKeys.clear();
+        s->modifierCandidate = FcitxKey_None;
         s->preedit.clear();
         s->cursor = 0;
         clearDisplayState(s);
@@ -2153,9 +2155,12 @@ public:
       return;
     }
     current->active = true;
-    current->english = *config_.input->defaultLanguage ==
-                       wetype_config::DefaultLanguage::English;
-    current->traditional = false;
+    // activate() runs on every focus-in; seed language state only once.
+    if (!current->languageInitialized) {
+      current->english = *config_.input->defaultLanguage ==
+                         wetype_config::DefaultLanguage::English;
+      current->languageInitialized = true;
+    }
     ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
     if (ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
@@ -2174,6 +2179,9 @@ public:
     clearVMenu(s);
     s->selectionPending = false;
     s->deferredKeys.clear();
+    // A modifier press belongs to the current focus/composition lifetime.
+    // Its release after a focus round trip must not toggle the saved language.
+    s->modifierCandidate = FcitxKey_None;
     ++s->epoch;
     s->initialPanelDeadline = 0;
     s->initialPanelShown = false;
