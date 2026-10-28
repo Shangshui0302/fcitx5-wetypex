@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <deque>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -2618,6 +2619,38 @@ static void engine_log(int level, const char *s) {
     fprintf(stderr, "IME[%d] %s\n", level, s ? s : "(null)");
 }
 #include "business_services.hpp"
+// The pinned C ABI has a 24-byte entry: an optional FD descriptor, path,
+// type and version. It has no uniqueID field. Only one table for each type
+// can be registered; the three Wubi tables all use type 524291.
+struct NativeDict {
+  void *asset;
+  const char *path;
+  uint32_t id, version;
+};
+struct NativeDictConfig {
+  NativeDict *dicts;
+  uint32_t count, padding;
+  const char *user_path;
+};
+static_assert(sizeof(NativeDict) == 24 && sizeof(NativeDictConfig) == 24);
+static std::deque<std::string> dictionaryPaths;
+static std::array<std::vector<NativeDict>, 3> dictionarySets;
+static std::array<bool, 3> wubiDictionaryAvailable{};
+static int configuredWubiDictionary = -1;
+static bool configure_wubi_dictionary(unsigned solution) {
+  if (solution >= dictionarySets.size())
+    return false;
+  if (configuredWubiDictionary == int(solution))
+    return true;
+  auto &dicts = dictionarySets[solution];
+  NativeDictConfig config{dicts.data(), uint32_t(dicts.size()), 0,
+                          "/work/userDict"};
+  const bool loaded =
+      ((bool (*)(const NativeDictConfig *))syms.at("_wxime_config_dict"))(&config);
+  if (loaded)
+    configuredWubiDictionary = int(solution);
+  return loaded;
+}
 #include "service.hpp"
 struct LlmResultItem {
   const unsigned char *data;
@@ -3164,21 +3197,6 @@ int main(int argc, char **argv) {
   }
   if (mode == "serve" && getenv("WETYPE_NETWORK_LIVE"))
     network_login_service(false, false, false);
-  struct Dict {
-    void *asset;
-    const char *path;
-    uint32_t id, version;
-  };
-  struct DictConfig {
-    Dict *dicts;
-    uint32_t count;
-    uint32_t padding;
-    const char *user_path;
-  };
-  static_assert(sizeof(Dict) == 24 && sizeof(DictConfig) == 24);
-  std::vector<std::string> paths;
-  paths.reserve(100);
-  std::vector<Dict> dicts;
   std::ifstream dictfile(dir + "/dicts.txt");
   while (std::getline(dictfile, line)) {
     std::istringstream s(line);
@@ -3187,13 +3205,20 @@ int main(int argc, char **argv) {
     s >> id >> version >> name;
     if (name.empty())
       continue;
-    paths.push_back("/input/resources/" + name);
-    dicts.push_back({nullptr, paths.back().c_str(), id, version});
+    dictionaryPaths.push_back("/input/resources/" + name);
+    static const std::array<std::string, 3> wubiNames{
+        "swbd86.bin", "swbd98.bin", "swbdnc.bin"};
+    for (unsigned solution = 0; solution < dictionarySets.size(); ++solution) {
+      if (id == 524291 && name != wubiNames[solution])
+        continue;
+      if (id == 524291)
+        wubiDictionaryAvailable[solution] = true;
+      dictionarySets[solution].push_back(
+          {nullptr, dictionaryPaths.back().c_str(), id, version});
+    }
   }
-  DictConfig dc{dicts.data(), (uint32_t)dicts.size(), 0, "/work/userDict"};
-  fprintf(stderr, "CALL wxime_config_dict count=%u\n", dc.count);
-  bool loaded =
-      ((bool (*)(const DictConfig *))syms.at("_wxime_config_dict"))(&dc);
+  fprintf(stderr, "CALL wxime_config_dict count=%zu\n", dictionarySets[0].size());
+  bool loaded = configure_wubi_dictionary(0);
   fprintf(stderr, "WXIME_CONFIG_DICT_RETURNED %d\n", loaded);
   if (!loaded)
     _exit(88);

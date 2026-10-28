@@ -517,6 +517,14 @@ static void service_loop() {
         // enum (86/98/New Century).
         uint32_t wubiSolution = std::clamp<int>(
             wire::number(request.get(), "wubi_solution", 0), 0, 2);
+        if (keyboard == 5 &&
+            (!wubiDictionaryAvailable[wubiSolution] ||
+             !configure_wubi_dictionary(wubiSolution))) {
+          wire::put(response.get(), "error",
+                    std::string("selected Wubi dictionary is unavailable"));
+          transport.reply(source, wire::dump(response.get()));
+          continue;
+        }
         memcpy(config + 0x24, &wubiSolution, sizeof(wubiSolution));
         config[0x28] = wire::number(request.get(), "wubi_pinyin", 0);
         config[0x29] = wire::number(request.get(), "wubi_unique_commit", 0);
