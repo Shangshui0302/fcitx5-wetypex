@@ -359,7 +359,7 @@ class WeType : public InputMethodEngine {
     // Wayland-v2's virtual keyboard inherits physical modifiers even
     // when forwardKey requests none. Wait for their real release rather
     // than sending Shift+Left and selecting the closing bracket.
-    if (waylandV2(ic) && modifiersHeld(instance_, ic, s)) {
+    if (waylandV2(ic)) {
       s->pendingCursorSteps = steps;
       s->cursorExpected = expected;
       s->cursorDeadline = 0;
@@ -368,6 +368,9 @@ class WeType : public InputMethodEngine {
       scheduleCursorMove();
       return;
     }
+    emitCursor(ic, steps);
+  }
+  static void emitCursor(InputContext *ic, int steps) {
     for (int i = 0; i < std::abs(steps); ++i)
       ic->forwardKey(Key(steps < 0 ? FcitxKey_Left : FcitxKey_Right));
   }
@@ -441,7 +444,7 @@ class WeType : public InputMethodEngine {
     const int steps = s->pendingCursorSteps;
     // A click, selection or context change must not receive a late movement.
     if (matches) {
-      forwardCursor(ic, s, steps, {});
+      emitCursor(ic, steps);
       // Cursor keys and IM commits use different Wayland protocols. Give
       // the client a turn to apply the key before replaying nested pairs or
       // text. Surrounding-text acknowledgement can finish this earlier.
@@ -2685,7 +2688,18 @@ public:
                               uint32_t(KeyState::SimpleMask) &
                               ~uint32_t(KeyState::Shift);
         const auto scalar = Key::keySymToUnicode(sym);
-        if (!commands && scalar >= 0x20 && scalar != 0x7f) {
+        const bool queuedLetters = !s->english && std::any_of(
+            s->cursorKeys.begin(), s->cursorKeys.end(), [](const DeferredKey &key) {
+              const auto c = Key::keySymToUnicode(key.key.sym());
+              return !key.release && ((c >= 'a' && c <= 'z') ||
+                                     (c >= 'A' && c <= 'Z'));
+            });
+        const bool enter = sym == FcitxKey_Return || sym == FcitxKey_KP_Enter;
+        const bool orderedEdit =
+            (enter && (queuedLetters ||
+                       !e.rawKey().states().test(KeyState::Shift))) ||
+            (queuedLetters && (sym == FcitxKey_BackSpace || sym == FcitxKey_Delete));
+        if (!commands && ((scalar >= 0x20 && scalar != 0x7f) || orderedEdit)) {
           s->cursorKeys.push_back({e.rawKey(), e.isRelease(), e.time()});
           e.filterAndAccept();
           return;
@@ -3298,8 +3312,12 @@ public:
           mapped = left;
         }
       }
-      send(ic, "punctuation", std::string(1, asciiChar), 0, -1, -1, mapped,
-           pairCursor);
+      if (send(ic, "punctuation", std::string(1, asciiChar), 0, -1, -1, mapped,
+               pairCursor) && pairCursor >= 0 && waylandV2(ic)) {
+        // Keep later engine commits behind the paired cursor operation too,
+        // including a burst typed before this asynchronous reply arrives.
+        s->selectionPending = true;
+      }
       e.filterAndAccept();
       return;
     }
