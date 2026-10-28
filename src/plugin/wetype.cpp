@@ -6,6 +6,7 @@
 #include <clipboard_public.h>
 #include <csignal>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/event.h>
@@ -45,6 +46,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <type_traits>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -58,6 +60,12 @@ struct HasCursorCommit<Context, Flag,
     std::void_t<decltype(Flag::CommitStringWithCursor),
                 decltype(std::declval<Context &>().commitStringWithCursor(
                     std::declval<const std::string &>(), size_t{}))>>
+    : std::true_type {};
+template <typename System, typename = void>
+struct HasXkbMask : std::false_type {};
+template <typename System>
+struct HasXkbMask<System, std::void_t<decltype(
+    std::declval<const System &>().xkbStateMask(std::string{}))>>
     : std::true_type {};
 struct PunctuationEntry {
   char ascii;
@@ -231,6 +239,14 @@ struct State : InputContextProperty {
   bool english = false, fullWidth = false, traditional = false,
        englishPunctuation = false, vMode = false, vCalculator = false;
   bool languageInitialized = false;
+  uint32_t physicalModifiers = 0;
+  uint8_t pressedShifts = 0;
+  int pendingCursorSteps = 0;
+  uint64_t cursorDeadline = 0;
+  uint64_t cursorReplayAt = 0;
+  int64_t cursorTarget = -1;
+  std::string cursorExpected;
+  std::vector<DeferredKey> cursorKeys;
   bool selectionPending = false;
   std::vector<DeferredKey> deferredKeys;
   VMenu vMenu = VMenu::None;
@@ -284,7 +300,7 @@ class WeType : public InputMethodEngine {
   pid_t child_ = -1;
   int read_ = -1, write_ = -1;
   std::unique_ptr<EventSourceIO> reader_, writer_;
-  std::unique_ptr<EventSourceTime> timer_, numericTimer_;
+  std::unique_ptr<EventSourceTime> timer_, numericTimer_, cursorTimer_;
   std::unique_ptr<HandlerTableEntry<EventHandler>> languageModifierWatcher_;
   std::unique_ptr<HandlerTableEntry<EventHandler>> numericWatcher_;
   bool ready_ = false, failed_ = false, backendUpdates_ = false;
@@ -308,6 +324,136 @@ class WeType : public InputMethodEngine {
   std::string voiceToken_, voiceText_, voicePhase_, voiceError_;
   int voiceLevel_ = 0;
   pid_t syncChild_ = -1;
+  bool replayingCursorKeys_ = false;
+  static bool waylandV2(InputContext *ic) {
+    return std::string_view(ic->frontend()) == "wayland_v2";
+  }
+  template <typename System>
+  static bool modifiersHeld(System *instance, InputContext *ic, State *s) {
+    if constexpr (HasXkbMask<System>::value) {
+      if (const auto mask = instance->xkbStateMask(ic->display()))
+        return std::get<0>(*mask) || std::get<1>(*mask);
+    }
+    (void)instance;
+    (void)ic;
+    return s->physicalModifiers != 0;
+  }
+  static void clearCursorMove(State *s) {
+    s->pendingCursorSteps = 0;
+    s->cursorDeadline = 0;
+    s->cursorReplayAt = 0;
+    s->cursorTarget = -1;
+    s->cursorExpected.clear();
+    s->cursorKeys.clear();
+  }
+  void scheduleCursorMove() {
+    if (!cursorTimer_)
+      return;
+    cursorTimer_->setTime(now(CLOCK_MONOTONIC) + 1000);
+    cursorTimer_->setEnabled(true);
+  }
+  void forwardCursor(InputContext *ic, State *s, int steps,
+                     const std::string &expected) {
+    if (!steps)
+      return;
+    // Wayland-v2's virtual keyboard inherits physical modifiers even
+    // when forwardKey requests none. Wait for their real release rather
+    // than sending Shift+Left and selecting the closing bracket.
+    if (waylandV2(ic) && modifiersHeld(instance_, ic, s)) {
+      s->pendingCursorSteps = steps;
+      s->cursorExpected = expected;
+      s->cursorDeadline = 0;
+      s->cursorReplayAt = 0;
+      s->cursorTarget = -1;
+      scheduleCursorMove();
+      return;
+    }
+    for (int i = 0; i < std::abs(steps); ++i)
+      ic->forwardKey(Key(steps < 0 ? FcitxKey_Left : FcitxKey_Right));
+  }
+  void replayCursorKeys(InputContext *ic, std::vector<DeferredKey> keys) {
+    const bool previous = replayingCursorKeys_;
+    replayingCursorKeys_ = true;
+    const auto ref = ic->watch();
+    for (const auto &key : keys) {
+      auto *target = ref.get();
+      if (!target || !target->hasFocus() ||
+          !target->propertyFor(&factory_)->active ||
+          target->capabilityFlags().test(CapabilityFlag::Password))
+        break;
+      KeyEvent event(target, key.key, key.release, key.time);
+      if (!target->keyEvent(event)) {
+        const auto scalar = Key::keySymToUnicode(key.key.sym());
+        if (waylandV2(target) && scalar >= 0x20 && scalar != 0x7f) {
+          // The original uppercase symbol must survive replay after Shift
+          // has been released; native forwardKey cannot restore its mask.
+          if (!key.release)
+            target->commitString(utf8::UCS4ToUTF8(scalar));
+        } else
+          target->forwardKey(key.key, key.release, key.time);
+      }
+    }
+    replayingCursorKeys_ = previous;
+  }
+  bool resolveCursorMove(InputContext *ic, State *s) {
+    if (!s->pendingCursorSteps)
+      return false;
+    if (!s->active || !ic->hasFocus() ||
+        ic->capabilityFlags().test(CapabilityFlag::Password)) {
+      clearCursorMove(s);
+      return false;
+    }
+    const auto time = now(CLOCK_MONOTONIC);
+    const auto &surrounding = ic->surroundingText();
+    if (s->cursorReplayAt) {
+      const bool acknowledged = s->cursorTarget >= 0 && surrounding.isValid() &&
+          surrounding.cursor() == surrounding.anchor() &&
+          int64_t(surrounding.cursor()) == s->cursorTarget;
+      if (!acknowledged && time < s->cursorReplayAt)
+        return true;
+      auto keys = std::move(s->cursorKeys);
+      clearCursorMove(s);
+      replayCursorKeys(ic, std::move(keys));
+      return s->pendingCursorSteps != 0;
+    }
+    if (modifiersHeld(instance_, ic, s))
+      return true;
+    if (!s->cursorDeadline)
+      s->cursorDeadline = time + 250000;
+    // Terminals can support native input without exposing surrounding text.
+    // With no text to compare, preserve the ordered cursor-key fallback.
+    const bool hasText = surrounding.isValid() && !surrounding.text().empty();
+    bool matches = !hasText || surrounding.cursor() == surrounding.anchor();
+    if (matches && hasText) {
+      const auto &text = surrounding.text();
+      const auto byte = utf8::ncharByteLength(text.begin(), surrounding.cursor());
+      matches = byte >= 0 && size_t(byte) <= text.size();
+      if (matches && s->pendingCursorSteps < 0)
+        matches = size_t(byte) >= s->cursorExpected.size() &&
+                  text.compare(size_t(byte) - s->cursorExpected.size(),
+                               s->cursorExpected.size(), s->cursorExpected) == 0;
+      else if (matches)
+        matches = text.compare(size_t(byte), s->cursorExpected.size(),
+                               s->cursorExpected) == 0;
+    }
+    if (!matches && time < s->cursorDeadline)
+      return true;
+    const int steps = s->pendingCursorSteps;
+    // A click, selection or context change must not receive a late movement.
+    if (matches) {
+      forwardCursor(ic, s, steps, {});
+      // Cursor keys and IM commits use different Wayland protocols. Give
+      // the client a turn to apply the key before replaying nested pairs or
+      // text. Surrounding-text acknowledgement can finish this earlier.
+      s->cursorTarget = hasText ? int64_t(surrounding.cursor()) + steps : -1;
+      s->cursorReplayAt = time + 16000;
+      return true;
+    }
+    auto keys = std::move(s->cursorKeys);
+    clearCursorMove(s);
+    replayCursorKeys(ic, std::move(keys));
+    return s->pendingCursorSteps != 0;
+  }
   void startSync() {
     if (syncChild_ > 0 && waitpid(syncChild_, nullptr, WNOHANG) == 0)
       return;
@@ -485,7 +631,7 @@ class WeType : public InputMethodEngine {
     return entry->normal;
   }
   template <typename Context, typename Flag = CapabilityFlag>
-  static void commitStringAtCursor(Context *ic, const std::string &text,
+  void commitStringAtCursor(Context *ic, const std::string &text,
                                    size_t cursor) {
     const auto length = utf8::length(text);
     cursor = std::min(cursor, length);
@@ -500,8 +646,7 @@ class WeType : public InputMethodEngine {
     // committed text. Commit the complete pair first, then reproduce the
     // original desktop behavior with ordinary cursor movement.
     ic->commitString(text);
-    for (size_t i = cursor; i < length; ++i)
-      ic->forwardKey(Key(FcitxKey_Left));
+    forwardCursor(ic, state(ic), -int(length - cursor), text);
   }
   bool commitSymbol(InputContext *ic, State *s, char ascii, bool asciiMode) {
     const auto *entry = punctuationEntry(ascii);
@@ -509,7 +654,7 @@ class WeType : public InputMethodEngine {
       return false;
     if (s->pendingPairKey == ascii && !s->pendingPairRight.empty() &&
         nextSurroundingTextIs(ic, s->pendingPairRight)) {
-      ic->forwardKey(Key(FcitxKey_Right));
+      forwardCursor(ic, s, 1, s->pendingPairRight);
       s->pendingPairKey = 0;
       s->pendingPairRight.clear();
       s->symbolAutoState = 0;
@@ -1699,6 +1844,8 @@ class WeType : public InputMethodEngine {
     for (auto &[id, ref] : contexts_)
       if (auto *ic = ref.get()) {
         auto *s = ic->propertyFor(&factory_);
+        clearCursorMove(s);
+        s->physicalModifiers = s->pressedShifts = 0;
         ++s->epoch;
         s->seq = s->applied = s->inputSeq = 0;
         s->appliedUpdate = 0;
@@ -2176,6 +2323,19 @@ public:
           return true;
         });
     numericTimer_->setEnabled(false);
+    cursorTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 1000,
+        [this](auto *source, uint64_t time) {
+          bool pending = false;
+          for (auto &[id, ref] : contexts_)
+            if (auto *ic = ref.get())
+              pending |= resolveCursorMove(ic, ic->propertyFor(&factory_));
+          if (pending)
+            source->setTime(time + 2000);
+          source->setEnabled(pending);
+          return true;
+        });
+    cursorTimer_->setEnabled(false);
     timer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 100000, 0,
         [this](auto *source, uint64_t time) {
@@ -2283,6 +2443,7 @@ public:
     languageModifierWatcher_.reset();
     numericWatcher_.reset();
     numericTimer_.reset();
+    cursorTimer_.reset();
     timer_.reset();
     stop();
     stopSync();
@@ -2326,6 +2487,8 @@ public:
   void reset(const InputMethodEntry &, InputContextEvent &e) override {
     auto *ic = e.inputContext();
     auto *s = state(ic);
+    clearCursorMove(s);
+    s->physicalModifiers = s->pressedShifts = 0;
     if (voicePending_ && voiceSession_ == s->id)
       cancelVoice();
     if (vModeSession_ == s->id)
@@ -2499,6 +2662,41 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    if (!replayingCursorKeys_) {
+      s->physicalModifiers = e.rawKey().states().toInteger() &
+                             uint32_t(KeyState::SimpleMask);
+      const uint8_t shift = sym == FcitxKey_Shift_L ? 1 :
+                            sym == FcitxKey_Shift_R ? 2 : 0;
+      if (shift) {
+        if (e.isRelease())
+          s->pressedShifts &= ~shift;
+        else
+          s->pressedShifts |= shift;
+      }
+      if (e.isRelease() && key.isModifier())
+        s->physicalModifiers &= ~Key::keySymToStates(sym).toInteger();
+      if (s->pressedShifts)
+        s->physicalModifiers |= uint32_t(KeyState::Shift);
+    }
+    if (s->pendingCursorSteps) {
+      scheduleCursorMove();
+      if (!key.isModifier()) {
+        const auto commands = key.states().toInteger() &
+                              uint32_t(KeyState::SimpleMask) &
+                              ~uint32_t(KeyState::Shift);
+        const auto scalar = Key::keySymToUnicode(sym);
+        if (!commands && scalar >= 0x20 && scalar != 0x7f) {
+          s->cursorKeys.push_back({e.rawKey(), e.isRelease(), e.time()});
+          e.filterAndAccept();
+          return;
+        }
+        // Explicit application shortcuts and navigation override automatic
+        // caret placement. Preserve earlier text before processing that key.
+        auto keys = std::move(s->cursorKeys);
+        clearCursorMove(s);
+        replayCursorKeys(ic, std::move(keys));
+      }
+    }
     if (!e.isRelease() && !s->pendingNumericText.empty()) {
       const auto commands = key.states().toInteger() &
                             uint32_t(KeyState::SimpleMask) &
@@ -2562,6 +2760,14 @@ public:
         selectByKey(ic, pageIndex);
         s->modifierCandidate = Key();
         e.filterAndAccept();
+        return;
+      }
+      // Releasing one Shift while the other remains down is not a bare
+      // language-switch gesture. This also keeps deferred uppercase input
+      // in the language in which it was typed.
+      if ((sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) &&
+          s->pressedShifts) {
+        s->modifierCandidate = Key();
         return;
       }
       if (releasedModifier && languageSwitchKey(pressed)) {
