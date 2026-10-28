@@ -66,7 +66,25 @@ def recorder_options():
         result = subprocess.run(['pw-record', '--help'], capture_output=True,
                                 timeout=3)
         if result.returncode == 0:
-            return result.stdout + result.stderr
+            options = result.stdout + result.stderr
+            if b'--raw' in options and shutil.which('pw-dump'):
+                # Installed tools do not prove an audio server is available.
+                # Screen-casting PipeWire instances may have no audio source.
+                probe = subprocess.run(['pw-dump'], capture_output=True,
+                                       timeout=1)
+                if probe.returncode != 0:
+                    return b''
+                try:
+                    nodes = json.loads(probe.stdout)
+                    def audio_source(node):
+                        info = node.get('info') if isinstance(node, dict) else None
+                        props = info.get('props') if isinstance(info, dict) else None
+                        return isinstance(props, dict) and props.get('media.class') == 'Audio/Source'
+                    if not isinstance(nodes, list) or not any(map(audio_source, nodes)):
+                        return b''
+                except ValueError:
+                    return b''
+            return options
     except (OSError, subprocess.TimeoutExpired):
         pass
     return b''
@@ -88,6 +106,10 @@ def microphone_command(config):
         return 'pipewire', command + ['-']
     # Old pw-record (including Ubuntu 22.04's 0.3.48) cannot produce this
     # raw PCM stream. PulseAudio clients also work with pipewire-pulse.
+    if selected and str(microphone).isdigit():
+        # PipeWire and PulseAudio numbers belong to different namespaces.
+        # Reusing a saved PipeWire ID could record a different Pulse source.
+        raise RuntimeError('音频后端已变化，请在设置中重新选择麦克风')
     if shutil.which('parec'):
         command = ['parec', '--raw', '--rate=16000', '--channels=1',
                    '--format=s16le', '--latency-msec=20',
