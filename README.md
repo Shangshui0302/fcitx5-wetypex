@@ -142,6 +142,33 @@ outputs = { nixpkgs, wetypex, ... }: {
 };
 ```
 
+Nix 包支持通过 `.override` 调整以下参数，四个布尔开关默认均为 `true`：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `enableAI` | `true` | 关闭时移除 AI 助手入口、查看器和 QtWebEngine 依赖；不影响随语音功能管理的智能润色。 |
+| `enableVoice` | `true` | 关闭时隐藏语音页面和快捷键、阻断语音调用，并移除语音助手、采集脚本及其命令工具依赖。 |
+| `enableLayerShell` | `true` | 关闭 V 模式的 LayerShell 浮动工具栏，改用 Fcitx 原生候选菜单；V 模式功能保留。 |
+| `enableWeTypeTheme` | `true` | 关闭时隐藏皮肤和字号控件，并禁止 WeTypeX 改写共用的 `classicui.conf`，便于桌面主题统一管理。不会自动恢复之前写入的皮肤。 |
+| `defaultSettings` | `{ }` | Nix 属性集，键沿用 `wetypex.json`；仅在偏好文件不存在时写入首次默认值。 |
+
+例如，在 `fcitx5.addons` 中使用：
+
+```nix
+(wetypex.packages.${pkgs.stdenv.hostPlatform.system}.fcitx5-wetypex.override {
+  enableAI = false;
+  enableVoice = false;
+  enableLayerShell = true;
+  enableWeTypeTheme = false;
+  defaultSettings = {
+    page_size = 7;
+    vertical = true;
+  };
+})
+```
+
+这些布尔参数在构建时生效，关闭的功能不能通过界面或已有偏好重新启用；修改后需重新构建、应用配置并重启 Fcitx5。`defaultSettings` 转换为 JSON，以原子方式创建权限为 `0600` 的偏好文件；已有文件不会覆盖或补写，之后仍可在界面修改。字段名和字段类型由上游设置读取逻辑解释，这里不提供逐字段校验。设备同步与云候选不受这些开关控制。
+
 应用系统配置后，按下方“首次设置”准备原版运行时。Nix 构建只安装社区适配层，原版安装包和资源仍由用户在接受上游许可后自行初始化。
 
 包的安装路径、动态库、证书和 Bubblewrap 沙箱已适配 Nix store；Nix 包由 flake 锁文件管理更新，内置发行版更新器关闭。更新 input 后重新构建系统即可升级。

@@ -28,7 +28,15 @@
   wl-clipboard,
   desktop-file-utils,
   src ? lib.cleanSource ../.,
+  enableAI ? true,
+  enableVoice ? true,
+  enableLayerShell ? true,
+  enableWeTypeTheme ? true,
+  defaultSettings ? { },
 }:
+
+assert lib.assertMsg (builtins.isAttrs defaultSettings)
+  "WeTypeX defaultSettings must be an attribute set";
 
 let
   projectLine =
@@ -45,17 +53,24 @@ let
     ps.fonttools
     ps.pillow
   ]);
-  runtimePath = lib.makeBinPath [
-    coreutils
-    util-linux
-    bubblewrap
-    fontconfig
-    pipewire
-    pulseaudio
-    ffmpeg
-    wl-clipboard
-    python
-  ];
+  defaultSettingsFile = writeText "fcitx5-wetypex-default-settings.json" (
+    builtins.toJSON defaultSettings
+  );
+  runtimePath = lib.makeBinPath (
+    [
+      coreutils
+      util-linux
+      bubblewrap
+      fontconfig
+      wl-clipboard
+      python
+    ]
+    ++ lib.optionals enableVoice [
+      pipewire
+      pulseaudio
+      ffmpeg
+    ]
+  );
   nsswitch = writeText "wetypex-nsswitch.conf" "hosts: files dns\n";
   # Keep the same fixed revision as CMake, with no configure-time download.
   kqueueSource = fetchFromGitHub {
@@ -80,7 +95,11 @@ stdenv.mkDerivation {
       ]);
   };
 
-  patches = [ ./runtime.patch ];
+  patches = [
+    ./runtime.patch
+    ./feature-options.patch
+  ]
+  ++ lib.optional (!enableWeTypeTheme) ./preserve-desktop-theme.patch;
 
   nativeBuildInputs = [
     cmake
@@ -104,9 +123,9 @@ stdenv.mkDerivation {
     kdePackages.qtbase
     kdePackages.qtsvg
     kdePackages.qtwayland
-    kdePackages.qtwebengine
-    kdePackages.layer-shell-qt
-  ];
+  ]
+  ++ lib.optional enableAI kdePackages.qtwebengine
+  ++ lib.optional enableLayerShell kdePackages.layer-shell-qt;
 
   postPatch = ''
     # Distribution installers cannot update an immutable Nix store package.
@@ -124,6 +143,8 @@ stdenv.mkDerivation {
         --replace-quiet '@NIX_TZDIR@' '${tzdata}/share/zoneinfo' \
         --replace-quiet '@NIX_LIBCXX@' '${lib.getLib llvmPackages.libcxx}/lib/libc++.so.1' \
         --replace-quiet '@NIX_LIBCXXABI@' '${lib.getLib llvmPackages.libcxx}/lib/libc++abi.so.1' \
+        --replace-quiet '@NIX_DEFAULT_SETTINGS@' "$out/share/fcitx5-wetypex/default-settings.json" \
+        --replace-quiet '@NIX_VOICE_ENABLED@' '${if enableVoice then "1" else "0"}' \
         --replace-quiet '@NIX_OUT@' "$out"
     done < <(grep -rlZ '@NIX_' scripts src tools)
     patchShebangs scripts tools
@@ -143,7 +164,9 @@ stdenv.mkDerivation {
     "-DFETCHCONTENT_SOURCE_DIR_KQUEUE=${kqueueSource}"
     "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
     "-DWETYPE_QT_VERSION=6"
-    "-DWETYPE_LAYER_SHELL=ON"
+    "-DWETYPE_LAYER_SHELL=${if enableLayerShell then "ON" else "OFF"}"
+    "-DWETYPE_ENABLE_AI=${lib.boolToString enableAI}"
+    "-DWETYPE_ENABLE_VOICE=${lib.boolToString enableVoice}"
     "-DWETYPE_BUNDLED_CURL=OFF"
     "-DWETYPE_CLANGXX=${llvmPackages.libcxxStdenv.cc}/bin/clang++"
   ];
@@ -161,7 +184,12 @@ stdenv.mkDerivation {
     ${python}/bin/python3 -m py_compile \
       ../scripts/*.py ../tools/*.py \
       fcitx5-wetypex-syncd fcitx5-wetypex-update fcitx5-wetypex-sync
+    ${python}/bin/python3 ../tests/test_init_settings.py
     runHook postCheck
+  '';
+
+  postInstall = ''
+    install -Dm444 ${defaultSettingsFile} "$out/share/fcitx5-wetypex/default-settings.json"
   '';
 
   nativeInstallCheckInputs = [ desktop-file-utils ];
@@ -177,6 +205,19 @@ stdenv.mkDerivation {
     "$out/bin/fcitx5-wetypex-account" network-info > network-info.json
     ${python}/bin/python3 -c \
       'import json; d=json.load(open("network-info.json")); assert all(d[k] for k in ("utf8_json", "ws", "wss")), d'
+    "$out/bin/fcitx5-wetypex-init-settings" --help >/dev/null
+    ${lib.optionalString (!enableAI) ''
+      test ! -e "$out/bin/fcitx5-wetypex-ai"
+      test ! -e "$out/bin/fcitx5-wetypex-ai-viewer"
+    ''}
+    ${lib.optionalString (!enableVoice) ''
+      test ! -e "$out/bin/fcitx5-wetypex-voice"
+      test ! -e "$out/share/fcitx5-wetypex/voice_stream.py"
+      code=0
+      "$out/bin/fcitx5-wetypex-account" voice-file /nonexistent > /dev/null 2>voice-disabled.txt || code=$?
+      test "$code" -eq 78
+      grep -q 'disabled by the package configuration' voice-disabled.txt
+    ''}
     runHook postInstallCheck
   '';
 
