@@ -1,7 +1,40 @@
+diff --git a/src/plugin/config.hpp b/src/plugin/config.hpp
+index 734ee11..56b9a30 100644
+--- a/src/plugin/config.hpp
++++ b/src/plugin/config.hpp
+@@ -32,8 +32,6 @@ enum class WubiScheme { Wubi86, Wubi98, NewCentury };
+ FCITX_CONFIG_ENUM_NAME(WubiScheme, "86 五笔", "98 五笔", "新世纪五笔")
+ enum class DefaultLanguage { Chinese, English };
+ FCITX_CONFIG_ENUM_NAME(DefaultLanguage, "中文", "英文")
+-enum class ThemeMode { System, Light, Dark };
+-FCITX_CONFIG_ENUM_NAME(ThemeMode, "跟随系统", "浅色", "深色")
+ enum class CandidateLabelStyle { WeType, Fcitx };
+ FCITX_CONFIG_ENUM_NAME(CandidateLabelStyle, "微信风格", "Fcitx 默认")
+ enum class PreeditPosition { Client, Candidate };
+@@ -123,8 +121,6 @@ FCITX_CONFIGURATION(PhraseClipboardConfig,
+
+ FCITX_CONFIGURATION(
+     AppearanceConfig,
+-    Option<int, IntConstrain> candidateSize{this, "CandidateSize", "候选字大小",
+-                                            13, IntConstrain(10, 18)};
+     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
+                                        IntConstrain(3, 9)};
+     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
+@@ -132,8 +128,7 @@ FCITX_CONFIGURATION(
+         this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
+     Option<CandidateLabelStyle> labelStyle{this, "CandidateLabelStyle",
+                                            "候选序号样式",
+-                                           CandidateLabelStyle::WeType};
+-    Option<ThemeMode> theme{this, "Theme", "主题模式", ThemeMode::System};)
++                                           CandidateLabelStyle::WeType};)
+
+ FCITX_CONFIGURATION(
+     ShortcutConfig, Option<bool> shiftSwitch{this, "ShiftSwitch",
 diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
+index e59dfe3..56815d3 100644
 --- a/src/plugin/wetype.cpp
 +++ b/src/plugin/wetype.cpp
-@@ -853,8 +853,6 @@
+@@ -865,8 +865,6 @@ class WeType : public InputMethodEngine {
      phrases->clipboard.setValue(clipboardEnabled_);
      auto *appearance = config_.appearance.mutableValue();
      appearance->pageSize.setValue(pageSize_);
@@ -10,7 +43,7 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
      appearance->vertical.setValue(vertical_);
      appearance->preeditPosition.setValue(
          wire::str(j.get(), "preedit_position") == "candidate"
-@@ -864,8 +862,6 @@
+@@ -876,8 +874,6 @@ class WeType : public InputMethodEngine {
          wire::str(j.get(), "candidate_label_style") == "fcitx"
              ? wetype_config::CandidateLabelStyle::Fcitx
              : wetype_config::CandidateLabelStyle::WeType);
@@ -19,7 +52,7 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
      auto *devices = config_.devices.mutableValue();
      devices->clipboardSync.setValue(
          json_object_get_boolean(wire::get(j.get(), "device_clipboard_sync")));
-@@ -1002,7 +998,6 @@
+@@ -1017,7 +1013,6 @@ class WeType : public InputMethodEngine {
      wire::put(json.get(), "fuzzy_eng_ong", bool(*input.fuzzyEngOng));
      const auto &appearance = *config_.appearance;
      wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
@@ -27,7 +60,7 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
      wire::put(json.get(), "vertical", bool(*appearance.vertical));
      wire::put(json.get(), "preedit_position",
                std::string(*appearance.preeditPosition ==
-@@ -1014,7 +1009,6 @@
+@@ -1029,7 +1024,6 @@ class WeType : public InputMethodEngine {
                                    wetype_config::CandidateLabelStyle::Fcitx
                                ? "fcitx"
                                : "wetype"));
@@ -35,11 +68,10 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
      wire::put(json.get(), "clipboard_enabled",
                bool(config_.phrases->clipboard.value()));
      const auto &devices = *config_.devices;
-@@ -1081,56 +1075,6 @@
-     chmod(temporary.c_str(), 0600);
+@@ -1100,56 +1094,6 @@ class WeType : public InputMethodEngine {
      std::filesystem::rename(temporary, path, error);
      reloadSettings();
--  }
+   }
 -  void applyAppearance() {
 -    const char *configHome = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
 -    std::filesystem::path path =
@@ -89,10 +121,11 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
 -    std::filesystem::rename(temporary, path, error);
 -    if (!error)
 -      instance_->reloadAddonConfig("classicui");
-   }
+-  }
    void applyDeviceFunctions() {
      std::ifstream input(stateDirectory() / "sync-state.json");
-@@ -2448,7 +2392,6 @@
+     std::string bytes((std::istreambuf_iterator<char>(input)), {});
+@@ -2466,7 +2410,6 @@ public:
      config_.load(raw, true);
      enforceBuildFeatures();
      saveNativeConfig();
@@ -100,41 +133,11 @@ diff --git a/src/plugin/wetype.cpp b/src/plugin/wetype.cpp
      if (networkEnabled_) {
        applyDeviceFunctions();
        startSync();
-diff --git a/src/plugin/config.hpp b/src/plugin/config.hpp
---- a/src/plugin/config.hpp
-+++ b/src/plugin/config.hpp
-@@ -32,8 +32,6 @@
- FCITX_CONFIG_ENUM_NAME(WubiScheme, "86 五笔", "98 五笔", "新世纪五笔")
- enum class DefaultLanguage { Chinese, English };
- FCITX_CONFIG_ENUM_NAME(DefaultLanguage, "中文", "英文")
--enum class ThemeMode { System, Light, Dark };
--FCITX_CONFIG_ENUM_NAME(ThemeMode, "跟随系统", "浅色", "深色")
- enum class CandidateLabelStyle { WeType, Fcitx };
- FCITX_CONFIG_ENUM_NAME(CandidateLabelStyle, "微信风格", "Fcitx 默认")
- enum class PreeditPosition { Client, Candidate };
-@@ -123,8 +121,6 @@
-
- FCITX_CONFIGURATION(
-     AppearanceConfig,
--    Option<int, IntConstrain> candidateSize{this, "CandidateSize", "候选字大小",
--                                            13, IntConstrain(10, 18)};
-     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
-                                        IntConstrain(3, 9)};
-     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
-@@ -132,8 +128,7 @@
-         this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
-     Option<CandidateLabelStyle> labelStyle{this, "CandidateLabelStyle",
-                                            "候选序号样式",
--                                           CandidateLabelStyle::WeType};
--    Option<ThemeMode> theme{this, "Theme", "主题模式", ThemeMode::System};)
-+                                           CandidateLabelStyle::WeType};)
-
- FCITX_CONFIGURATION(
-     ShortcutConfig, Option<bool> shiftSwitch{this, "ShiftSwitch",
 diff --git a/src/settings/main.cpp b/src/settings/main.cpp
+index ae04939..4f2121d 100644
 --- a/src/settings/main.cpp
 +++ b/src/settings/main.cpp
-@@ -230,32 +230,6 @@
+@@ -240,32 +240,6 @@ static bool editHotword(QWidget *owner, const QJsonObject &existing = {}) {
    });
    return dialog.exec() == QDialog::Accepted;
  }
@@ -167,7 +170,7 @@ diff --git a/src/settings/main.cpp b/src/settings/main.cpp
  static QFrame *rowsCard(const QList<QWidget *> &rows) {
    auto *frame = card();
    auto *layout = new QVBoxLayout(frame);
-@@ -531,40 +505,6 @@
+@@ -541,40 +515,6 @@ static QWidget *shortcutRow(const QString &title, bool checked,
                       [setting](bool value) { writeSetting(setting, value); });
    return container;
  }
@@ -208,15 +211,15 @@ diff --git a/src/settings/main.cpp b/src/settings/main.cpp
  using ToggleSpec = std::tuple<QString, QString, bool>;
  static void runToggleDialog(QWidget *owner, const QString &title,
                              const QList<ToggleSpec> &options) {
-@@ -652,7 +592,6 @@
-   if (!QFileInfo::exists(configDir() + "/wetypex.json"))
+@@ -665,7 +605,6 @@ int main(int argc, char **argv) {
+   if (!preferences.exists() && !preferences.isSymLink())
      QProcess::execute(QStringLiteral(WETYPE_INIT_SETTINGS), QStringList{});
    const auto settings = readSettings();
 -  const auto appearance = readAppearance();
    app.setStyleSheet(R"(
      * { font-family:"Microsoft YaHei","Noto Sans CJK SC",sans-serif; font-size:14px; color:#202124; }
      QWidget#windowSurface,QWidget#contentPage,QScrollArea#pageScroll,QScrollArea#pageScroll>QWidget>QWidget { background:#f7f7f7; }
-@@ -1138,31 +1077,8 @@
+@@ -1151,31 +1090,8 @@ int main(int argc, char **argv) {
    preview->setStyleSheet(
        "background:#ccefd3;border-radius:10px;font-size:18px;");
    visual.body->addWidget(preview);
@@ -250,7 +253,7 @@ diff --git a/src/settings/main.cpp b/src/settings/main.cpp
    auto *preeditPosition = new QComboBox;
    preeditPosition->addItems({"输入框内", "候选框内"});
    preeditPosition->setCurrentIndex(
-@@ -1201,18 +1117,6 @@
+@@ -1214,18 +1130,6 @@ int main(int argc, char **argv) {
                                               : QStringLiteral("wetype"));
                       updatePreview();
                     });

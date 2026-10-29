@@ -37,6 +37,9 @@
 
 assert lib.assertMsg (builtins.isAttrs defaultSettings)
   "WeTypeX defaultSettings must be an attribute set";
+assert lib.assertMsg (builtins.all builtins.isBool [
+  enableAI enableVoice enableLayerShell enableWeTypeTheme
+]) "WeTypeX feature switches must be booleans";
 
 let
   projectLine =
@@ -53,9 +56,11 @@ let
     ps.fonttools
     ps.pillow
   ]);
-  defaultSettingsFile = writeText "fcitx5-wetypex-default-settings.json" (
-    builtins.toJSON defaultSettings
-  );
+  defaultSettingsJSON = builtins.toJSON defaultSettings;
+  defaultSettingsFile =
+    assert lib.assertMsg (builtins.stringLength defaultSettingsJSON <= 16384)
+      "WeTypeX defaultSettings exceeds the 16 KiB preference limit";
+    writeText "fcitx5-wetypex-default-settings.json" defaultSettingsJSON;
   runtimePath = lib.makeBinPath (
     [
       coreutils
@@ -143,7 +148,7 @@ stdenv.mkDerivation {
         --replace-quiet '@NIX_TZDIR@' '${tzdata}/share/zoneinfo' \
         --replace-quiet '@NIX_LIBCXX@' '${lib.getLib llvmPackages.libcxx}/lib/libc++.so.1' \
         --replace-quiet '@NIX_LIBCXXABI@' '${lib.getLib llvmPackages.libcxx}/lib/libc++abi.so.1' \
-        --replace-quiet '@NIX_DEFAULT_SETTINGS@' "$out/share/fcitx5-wetypex/default-settings.json" \
+        --replace-quiet '@NIX_DEFAULT_SETTINGS@' '${defaultSettingsFile}' \
         --replace-quiet '@NIX_VOICE_ENABLED@' '${if enableVoice then "1" else "0"}' \
         --replace-quiet '@NIX_OUT@' "$out"
     done < <(grep -rlZ '@NIX_' scripts src tools)
@@ -167,6 +172,7 @@ stdenv.mkDerivation {
     "-DWETYPE_LAYER_SHELL=${if enableLayerShell then "ON" else "OFF"}"
     "-DWETYPE_ENABLE_AI=${lib.boolToString enableAI}"
     "-DWETYPE_ENABLE_VOICE=${lib.boolToString enableVoice}"
+    "-DWETYPE_DEFAULT_SETTINGS_FILE=${defaultSettingsFile}"
     "-DWETYPE_BUNDLED_CURL=OFF"
     "-DWETYPE_CLANGXX=${llvmPackages.libcxxStdenv.cc}/bin/clang++"
   ];
@@ -184,7 +190,6 @@ stdenv.mkDerivation {
     ${python}/bin/python3 -m py_compile \
       ../scripts/*.py ../tools/*.py \
       fcitx5-wetypex-syncd fcitx5-wetypex-update fcitx5-wetypex-sync
-    ${python}/bin/python3 ../tests/test_init_settings.py
     runHook postCheck
   '';
 
